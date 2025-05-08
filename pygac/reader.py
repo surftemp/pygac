@@ -100,13 +100,14 @@ class Reader(ABC):
 
     # data set header format, see _validate_header for more details
     data_set_pattern = re.compile(
-        r"\w{3}\.\w{4}\.\w{2}.D\d{5}\.S\d{4}\.E\d{4}\.B\d{7}\.\w{2}")
+        r"(?P<site>\w{3})\.(?P<type>\w{4})\.(?P<id>\w{2})\.D(?P<date>\d{5})"
+        + r"\.S(?P<start>\d{4})\.E(?P<end>\d{4})\.B(?P<block>\d{7})\.(?P<src>\w{2})")
 
     def __init__(self, interpolate_coords=True, adjust_clock_drift=True,
                  tle_dir=None, tle_name=None, tle_thresh=7, creation_site=None,
                  custom_calibration=None, calibration_file=None, header_date="auto",
                  calibration_method="noaa", calibration_parameters=None,
-                 correct_scanlines=True):
+                 correct_scanlines=True, correct_scantimes='pygac'):
         """Init the reader.
 
         Args:
@@ -123,7 +124,8 @@ class Reader(ABC):
                                 calibration coefficients
             calibration_file: path to json file containing default calibrations
             header_date: the date to use for pod header choice. Defaults to "auto".
-            correct_scanlines: Remove corrrupt scanline numbers. Defaults to True
+            correct_scanlines: Remove corrupt scanline numbers. Defaults to True
+            correct_scantimes: Apply correction to scanline times.
 
         """
         self.meta_data = {}
@@ -135,6 +137,7 @@ class Reader(ABC):
         self.creation_site = (creation_site or "NSS").encode("utf-8")
         self.header_date = header_date
         self.correct_scanlines = correct_scanlines
+        self.correct_scantimes = correct_scantimes
         self.head = None
         self.scans = None
         self.spacecraft_name = None
@@ -460,15 +463,20 @@ class Reader(ABC):
         if self._times_as_np_datetime64 is None:
             # Read timestamps
             year, jday, msec = self._get_times_from_file()
-
-            # Correct invalid values
-            year, jday, msec = self.correct_times_median(year=year, jday=jday,
-                                                         msec=msec)
             self._times_as_np_datetime64 = self.to_datetime64(year=year, jday=jday, msec=msec)
-            try:
-                self._times_as_np_datetime64 = self.correct_times_thresh()
-            except TimestampMismatch as err:
-                LOG.error(str(err))
+
+            if self.correct_scantimes == 'pygac':
+                # Correct invalid values
+                year, jday, msec = self.correct_times_median(year=year, jday=jday,
+                                                            msec=msec)
+                self._times_as_np_datetime64 = self.to_datetime64(year=year, jday=jday, msec=msec)
+                try:
+                    self._times_as_np_datetime64 = self.correct_times_thresh()
+                except TimestampMismatch as err:
+                    LOG.error(str(err))
+
+            elif self.correct_scantimes == 'sstcci':
+                self.correct_times_sstcci()
 
         return self._times_as_np_datetime64
 
@@ -1180,6 +1188,97 @@ class Reader(ABC):
         LOG.debug("Corrected %s timestamp(s)", str(len(corrupt_lines[0])))
 
         return self._times_as_np_datetime64
+
+    def correct_times_sstcci(self, threshold=0.2):
+        """Correct corrupted timestamps using the SST-CCI method.
+
+        Args:
+            threshold (float): Threshold for timestamp gap / corruption
+                detection, specified in effective number of scanlines.
+
+        Returns:
+            None
+
+        """
+
+        times = self._times_as_np_datetime64
+        t0 = np.datetime64(self.get_header_timestamp('start'))
+        t1 = np.datetime64(self.get_header_timestamp('end'))
+
+        # Time relative to start of file
+        delta_msec = (times - t0) / np.timedelta64(1, 'ms')
+
+        # Calculate offset in scanline position estimated from scantime and ideal
+        # Offset should start at zero, and increase whenever there is a data gap
+        ideal = np.arange(len(self.scans))
+        offset = xr.DataArray(delta_msec * self.scan_freq - ideal, dims=['line'])
+
+        # Flag scanlines which fall outside the header timestamps
+        # TODO - check for corrupt header timestamps and skip this check if needed
+        #        e.g. could take times from filename
+        mask_bounds = np.isnan(offset) | (times < t0) | (times > t1)
+        LOG.info(f"Masking {mask_bounds.sum().item()} out of bounds")
+        offset[mask_bounds] = np.nan
+        offset = offset.ffill('line')
+
+        # Filter simple outliers. These are cases where one (or two) scanlines
+        # have anomalous scantimes before returning to the previous pattern.
+        # This does not include cases where a bad scantime overlaps a data gap
+        mask_simple = np.isnan(offset)
+        step = np.diff(offset)
+        for i in np.nonzero(step < -threshold)[0]:
+            if step[i-1] + step[i] == 0:
+                # Positive spike
+                mask_simple[i] = True
+            elif step[i] + step[i+1] == 0:
+                # Negative spike
+                mask_simple[i+1] = True
+            elif step[i-2] + step[i] == 0:
+                mask_simple[i-1] = True
+                mask_simple[i] = True
+            elif step[i] + step[i+2] == 0:
+                mask_simple[i] = True
+                mask_simple[i+1] = True
+
+        LOG.info(f"Masking {mask_simple.sum().item()} simple outliers")
+        offset[mask_simple] = np.nan
+        offset = offset.ffill('line')
+
+        # Filter other outliers. This covers any other cases where the scanline
+        # offset decreases (i.e. time moves backwards) such as coincident bad
+        # time and data gap, or consecutive bad times.
+        mask_other = np.isnan(offset)
+        step = np.diff(offset)
+        for i in np.nonzero(step < -threshold)[0]:
+            left = offset[:i+1] > offset[i+1]
+            right = offset[i+1:] < offset[i]
+            if np.sum(right) > np.sum(left):
+                mask_other[:i+1] |= left
+            else:
+                mask_other[i+1:] |= right
+
+        LOG.info(f"Masking {mask_other.sum().item()} other outliers")
+        offset[mask_other] = np.nan
+        offset = offset.ffill('line')
+
+        # Report an error if scantime is still not increasing monotonically
+        step = np.diff(offset)
+        if np.any(np.diff(offset) < -threshold):
+            LOG.error("correct_times_sstcci failed - scantime still jumps backwards")
+
+        # Save where we have changed the scantimes or detected data gaps as
+        # this should now be used inplace of the Level 1b Quality flags
+        self._mask_time = mask_bounds | mask_simple | mask_other
+        self._mask_gap = np.concatenate(([False], step > threshold))
+
+        # Convert the offsets back to scantimes
+        new_delta_msec = ((ideal + offset.values) / self.scan_freq).astype('m8[ms]')
+        self._times_as_np_datetime64 = t0 + new_delta_msec
+
+        # Update the scanline numbers to match the times
+        if not self.scans.flags.writeable:
+            self.scans = self.scans.copy()
+        self.scans["scan_line_number"] = ideal + offset.values + 1
 
     @property
     @abstractmethod

@@ -422,8 +422,11 @@ class PODReader(Reader):
         if platform_id not in allowed_ids:
             raise ReaderError('Improper platform id "%s"!' % platform_id)
 
-    def get_header_timestamp(self):
+    def get_header_timestamp(self, which='start'):
         """Get the timestamp from the header.
+
+        Args:
+            which: Timestamp to get. May be 'start' (default) or 'end'
 
         Returns:
             A datetime object containing the timestamp from the header.
@@ -432,7 +435,12 @@ class PODReader(Reader):
             A ValueError if the timestamp is corrupt.
 
         """
-        year, jday, msec = self.decode_timestamps(self.head["start_time"])
+        if which == 'start':
+            year, jday, msec = self.decode_timestamps(self.head["start_time"])
+        elif which == 'end':
+            year, jday, msec = self.decode_timestamps(self.head["end_time"])
+        else:
+            raise ValueError(f"Unknown timestamp option: {which}")
         try:
             return self.to_datetime(self.to_datetime64(year=year, jday=jday,
                                                        msec=msec))

@@ -767,8 +767,11 @@ class KLMReader(Reader):
         lons = self.scans["earth_location"]["lons"] / np.float32(1e4)
         return lons, lats
 
-    def get_header_timestamp(self):
+    def get_header_timestamp(self, which='start'):
         """Get the timestamp from the header.
+
+        Args:
+            which: Timestamp to get. May be 'start' (default) or 'end'
 
         Returns:
             A datetime object containing the timestamp from the header.
@@ -777,9 +780,16 @@ class KLMReader(Reader):
             A ValueError if the timestamp is corrupt.
 
         """
-        year = self.head["start_of_data_set_year"]
-        jday = self.head["start_of_data_set_day_of_year"]
-        msec = self.head["start_of_data_set_utc_time_of_day"]
+        if which=='start':
+            year = self.head["start_of_data_set_year"]
+            jday = self.head["start_of_data_set_day_of_year"]
+            msec = self.head["start_of_data_set_utc_time_of_day"]
+        elif which == 'end':
+            year = self.head["end_of_data_set_year"]
+            jday = self.head["end_of_data_set_day_of_year"]
+            msec = self.head["end_of_data_set_utc_time_of_day"]
+        else:
+            raise ValueError(f"Unknown timestamp option: {which}")
         try:
             return self.to_datetime(self.to_datetime64(year=year, jday=jday,
                                                        msec=msec))
