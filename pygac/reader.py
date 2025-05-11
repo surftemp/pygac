@@ -852,6 +852,7 @@ class Reader(ABC):
         # Make sure the TLE we found is within the threshold
         delta_days = abs(sdate - dates[iindex]) / np.timedelta64(1, "D")
         if delta_days > self.tle_thresh:
+            LOG.warning(f"Can't find suitable TLE data for {sdate}. Best match {delta_days} days")
             raise NoTLEData(
                 "Can't find tle data for %s within +/- %d days around %s" %
                 (self.spacecraft_name, self.tle_thresh, sdate))
@@ -1268,7 +1269,7 @@ class Reader(ABC):
 
         # Save where we have changed the scantimes or detected data gaps as
         # this should now be used inplace of the Level 1b Quality flags
-        self._mask_time = mask_bounds | mask_simple | mask_other
+        self._mask_time = (mask_bounds | mask_simple | mask_other).values
         self._mask_gap = np.concatenate(([False], step > threshold))
 
         # Convert the offsets back to scantimes
