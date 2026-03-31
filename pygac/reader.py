@@ -476,7 +476,10 @@ class Reader(ABC):
                     LOG.error(str(err))
 
             elif self.correct_scantimes == 'sstcci':
-                self.correct_times_sstcci()
+                try:
+                    self.correct_times_sstcci()
+                except TimestampMismatch as err:
+                    LOG.error(str(err))
 
         return self._times_as_np_datetime64
 
@@ -1218,7 +1221,7 @@ class Reader(ABC):
         # TODO - check for corrupt header timestamps and skip this check if needed
         #        e.g. could take times from filename
         mask_bounds = np.isnan(offset) | (times < t0) | (times > t1)
-        LOG.info(f"Masking {mask_bounds.sum().item()} out of bounds")
+        LOG.info(f"Timestamps: {mask_bounds.sum().item()} out of bounds")
         offset[mask_bounds] = np.nan
         offset = offset.ffill('line')
 
@@ -1241,7 +1244,7 @@ class Reader(ABC):
                 mask_simple[i] = True
                 mask_simple[i+1] = True
 
-        LOG.info(f"Masking {mask_simple.sum().item()} simple outliers")
+        LOG.info(f"Timestamps: {mask_simple.sum().item()} simple outliers")
         offset[mask_simple] = np.nan
         offset = offset.ffill('line')
 
@@ -1258,7 +1261,7 @@ class Reader(ABC):
             else:
                 mask_other[i+1:] |= right
 
-        LOG.info(f"Masking {mask_other.sum().item()} other outliers")
+        LOG.info(f"Timestamps: {mask_other.sum().item()} other outliers")
         offset[mask_other] = np.nan
         offset = offset.ffill('line')
 
@@ -1271,6 +1274,9 @@ class Reader(ABC):
         # this should now be used inplace of the Level 1b Quality flags
         self._mask_time = (mask_bounds | mask_simple | mask_other).values
         self._mask_gap = np.concatenate(([False], step > threshold))
+
+        if self._mask_time.all():
+            LOG.error("No valid timestamps.")
 
         # Convert the offsets back to scantimes
         new_delta_msec = ((ideal + offset.values) / self.scan_freq).astype('m8[ms]')
