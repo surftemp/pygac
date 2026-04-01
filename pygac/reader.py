@@ -1360,6 +1360,8 @@ class Reader(ABC):
         """
 
         times = self._times_as_np_datetime64
+        # TODO - check for corrupt header timestamps and skip this check if needed
+        #        e.g. could take times from filename
         t0 = np.datetime64(self.get_header_timestamp('start'))
         t1 = np.datetime64(self.get_header_timestamp('end'))
 
@@ -1372,12 +1374,16 @@ class Reader(ABC):
         offset = xr.DataArray(delta_msec * self.scan_freq - ideal, dims=['line'])
 
         # Flag scanlines which fall outside the header timestamps
-        # TODO - check for corrupt header timestamps and skip this check if needed
-        #        e.g. could take times from filename
-        mask_bounds = np.isnan(offset) | (times < t0) | (times > t1)
+        mask_bounds = np.isnan(offset) | (times < (t0 - np.timedelta64(60, 's'))) | (times > t1)
         LOG.info(f"Timestamps: {mask_bounds.sum().item()} out of bounds")
         offset[mask_bounds] = np.nan
-        offset = offset.ffill('line')
+        offset = offset.ffill('line').bfill('line')
+
+        if np.isnan(offset).all():
+            LOG.error("All timestamps invalid. Using header start time.")
+            offset[:] = 0
+        elif np.isnan(offset).any():
+            raise Exception("correct scantime: NaN offset should not occur here")
 
         # Filter simple outliers. These are cases where one (or two) scanlines
         # have anomalous scantimes before returning to the previous pattern.
@@ -1385,16 +1391,17 @@ class Reader(ABC):
         mask_simple = np.isnan(offset)
         step = np.diff(offset)
         for i in np.nonzero(step < -threshold)[0]:
-            if step[i-1] + step[i] == 0:
+            j = len(step) - i - 1 # Count from end of array for checking bounds
+            if i > 0 and step[i-1] + step[i] == 0:
                 # Positive spike
                 mask_simple[i] = True
-            elif step[i] + step[i+1] == 0:
+            elif j > 0 and step[i] + step[i+1] == 0:
                 # Negative spike
                 mask_simple[i+1] = True
-            elif step[i-2] + step[i] == 0:
+            elif i > 1 and step[i-2] + step[i] == 0:
                 mask_simple[i-1] = True
                 mask_simple[i] = True
-            elif step[i] + step[i+2] == 0:
+            elif j > 1 and step[i] + step[i+2] == 0:
                 mask_simple[i] = True
                 mask_simple[i+1] = True
 
