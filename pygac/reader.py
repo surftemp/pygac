@@ -46,6 +46,7 @@ from pyorbital.geoloc import compute_pixels, get_lonlatalt
 from pyorbital.orbital import Orbital
 
 from pygac import gac_io
+from pygac.slerp import slerp
 from pygac.utils import calculate_sun_earth_distance_correction, centered_modulus, get_absolute_azimuth_angle_diff
 
 LOG = logging.getLogger(__name__)
@@ -336,7 +337,7 @@ class Reader(ABC):
             buffer (bytes, bytearray): buffer to read from
             count (int): number of expected scanlines
         """
-        # Calculate the actual number of complete scanlines. The integer divisoin
+        # Calculate the actual number of complete scanlines. The integer division
         # may strip a potentially incomplete line at the end of the file.
         line_count = len(buffer) // self.scanline_type.itemsize
         if line_count != count:
@@ -1407,7 +1408,7 @@ class Reader(ABC):
 
         LOG.info(f"Timestamps: {mask_simple.sum().item()} simple outliers")
         offset[mask_simple] = np.nan
-        offset = offset.ffill('line')
+        offset = offset.ffill('line').bfill('line')
 
         # Filter other outliers. This covers any other cases where the scanline
         # offset decreases (i.e. time moves backwards) such as coincident bad
@@ -1424,7 +1425,7 @@ class Reader(ABC):
 
         LOG.info(f"Timestamps: {mask_other.sum().item()} other outliers")
         offset[mask_other] = np.nan
-        offset = offset.ffill('line')
+        offset = offset.ffill('line').bfill('line')
 
         # Report an error if scantime is still not increasing monotonically
         step = np.diff(offset)
@@ -1447,6 +1448,70 @@ class Reader(ABC):
         if not self.scans.flags.writeable:
             self.scans = self.scans.copy()
         self.scans["scan_line_number"] = ideal + offset.values + 1
+
+    def correct_lonlat_sstcci(self):
+        """Correct corrupted navigation by interpolating from nearest usable
+        geolocation data. Will also apply POD clock offsets if applicable.
+        
+        This function assumes that scanline times have been corrected using
+        the sstcci method.
+        """
+        if self.clock_drift_correction_applied:
+            LOG.error("Clock drift correction already applied.")
+            return
+
+        tic = datetime.datetime.now()
+        times = self.get_times()
+        lons, lats = self._get_lonlat_from_file()
+
+        # Need to exlude any scanlines with invalid navigation or timing data
+        # from the source grid. Note - the L1b flags are not a reliable indicator
+        # of bad data, so we are mostly relying on the mask set by correct_times_sstcci
+        QFlag = self.QFlag
+        flags = QFlag.FATAL_FLAG | QFlag.NO_EARTH_LOCATION
+        try:
+            mask = self._mask_time | self._get_corrupt_mask(flags)
+        except AttributeError:
+            LOG.warning("SSTCCI time correction not applied. Using L1b quality flag")
+            mask = self._get_corrupt_mask(flags | QFlag.TIME_ERROR)
+
+        times = times[~mask]
+        lons = lons[~mask]
+        lats = lats[~mask]
+
+
+        if self.adjust_clock_drift:
+            try:
+                offsets = self.compute_clock_offsets()
+                self._times_as_np_datetime64 -= (offsets * 1000).astype("timedelta64[ms]")
+                self.clock_drift_correction_applied = True
+                LOG.info("Applied clock drift correction")
+            except KeyError:
+                LOG.info(f"No clock drift info available for {self.spacecraft_name}")
+            except AttributeError:
+                # KLM sensors do not have clock drift corrections
+                pass
+
+        newtimes = self._times_as_np_datetime64
+
+        # Interpolation weights and indices
+        ind = np.clip(np.searchsorted(times, newtimes) - 1, 0, len(times) - 2)
+        dtime = newtimes - times[ind]
+        dstep = times[ind+1] - times[ind]
+        f = dtime / dstep
+        LOG.info(f"Maximum navigation separation: {dstep.max()/np.timedelta64(1, 's')}s")
+        s_offset = np.max(np.abs(np.where(f > 0.5, f-1, f)) * dstep) / np.timedelta64(1, 's')
+        LOG.info(f"Maximum slerp offset: {s_offset}s")
+
+        # perform the slerp interpolation to the corrected times
+        slerp_res = slerp(lons[ind], lats[ind], lons[ind+1], lats[ind+1], f[:, np.newaxis, np.newaxis])
+
+        # set corrected values
+        self.lons = slerp_res[:, :, 0]
+        self.lats = slerp_res[:, :, 1]
+
+        toc = datetime.datetime.now()
+        LOG.debug(f"Lon/lat adjustment took {toc-tic}")
 
     @property
     @abstractmethod
