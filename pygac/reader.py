@@ -1454,7 +1454,9 @@ class Reader(ABC):
         geolocation data. Will also apply POD clock offsets if applicable.
         
         This function assumes that scanline times have been corrected using
-        the sstcci method.
+        the sstcci method. This is neccessary to ensure:
+        1: Scantimes are monotonically increasing
+        2: Bad scantimes are correctly flagged and corrected
         """
         if self.clock_drift_correction_applied:
             LOG.error("Clock drift correction already applied.")
@@ -1499,9 +1501,6 @@ class Reader(ABC):
         dtime = newtimes - times[ind]
         dstep = times[ind+1] - times[ind]
         f = dtime / dstep
-        LOG.info(f"Maximum navigation separation: {dstep.max()/np.timedelta64(1, 's')}s")
-        s_offset = np.max(np.abs(np.where(f > 0.5, f-1, f)) * dstep) / np.timedelta64(1, 's')
-        LOG.info(f"Maximum slerp offset: {s_offset}s")
 
         # perform the slerp interpolation to the corrected times
         slerp_res = slerp(lons[ind], lats[ind], lons[ind+1], lats[ind+1], f[:, np.newaxis, np.newaxis])
@@ -1510,6 +1509,15 @@ class Reader(ABC):
         self.lons = slerp_res[:, :, 0]
         self.lats = slerp_res[:, :, 1]
 
+        # Flag any cases where the new nav is more than 0.5s (one GAC scanline)
+        # away from an original nav point. Clock shifts do no matter unless they
+        # push the line into a gap or beyond the end of the current file.
+        s_offset = np.abs(np.where(f > 0.5, f-1, f)) * dstep / np.timedelta64(1, 's')
+        self._mask_nav = s_offset > 0.5    # scan_freq is per ms
+
+        LOG.info(f"Maximum nav spacing: {dstep.max()/np.timedelta64(1, 's')}s")
+        LOG.info(f"Maximum slerp offset: {s_offset.max()}s")
+        LOG.info(f"{self._mask_nav.sum()} lines over 0.5s from source nav")
         toc = datetime.datetime.now()
         LOG.debug(f"Lon/lat adjustment took {toc-tic}")
 
