@@ -1481,7 +1481,6 @@ class Reader(ABC):
         lons = lons[~mask]
         lats = lats[~mask]
 
-
         if self.adjust_clock_drift:
             try:
                 offsets = self.compute_clock_offsets()
@@ -1493,6 +1492,20 @@ class Reader(ABC):
             except AttributeError:
                 # KLM sensors do not have clock drift corrections
                 pass
+
+        if len(times) < 2:
+            LOG.error("correct_lonlat_sstcci failed - no valid Earth location data")
+            # We can't set the lons/lats array here, so pygac behaviour will depend on
+            # user compute_lonlats_from_tles setting:
+            #   True:  lon/lat is calculated using pyorbital. Assume this is OK where l1b time is good
+            #   False: lon/lat is read from Level 1b. Data will all be invalid
+            if self.compute_lonlats_from_tles:
+                self._mask_nav = self._mask_time
+            else:
+                self._mask_nav = mask
+            return
+
+        LOG.info(f"Using navigation from {len(times)} / {len(mask)} scanlines")
 
         newtimes = self._times_as_np_datetime64
 
@@ -1510,7 +1523,7 @@ class Reader(ABC):
         self.lats = slerp_res[:, :, 1]
 
         # Flag any cases where the new nav is more than 0.5s (one GAC scanline)
-        # away from an original nav point. Clock shifts do no matter unless they
+        # away from an original nav point. Clock shifts do not matter unless they
         # push the line into a gap or beyond the end of the current file.
         s_offset = np.abs(np.where(f > 0.5, f-1, f)) * dstep / np.timedelta64(1, 's')
         self._mask_nav = s_offset > 0.5    # scan_freq is per ms
